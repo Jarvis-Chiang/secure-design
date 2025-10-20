@@ -1,6 +1,7 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { ChatSidebarProvider } from './providers/chatSidebarProvider';
 import { ServiceContainer } from './di/ServiceContainer';
 import { type WebviewApiProvider, Logger } from 'react-vscode-webview-ipc/host';
@@ -10,6 +11,52 @@ import type ChatMessagesRepository from './chat/ChatMessagesRepository';
 
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
+
+const allowedImageMimeTypes: Record<string, string[]> = {
+    'image/jpeg': ['.jpg', '.jpeg'],
+    'image/png': ['.png'],
+    'image/gif': ['.gif'],
+    'image/webp': ['.webp'],
+    'image/bmp': ['.bmp'],
+};
+
+function validateAndDecodeBase64Image(base64Data: string, expectedSize: number): Buffer {
+    const base64Content = base64Data.includes(',') ? base64Data.split(',').pop() : base64Data;
+    if (!base64Content) {
+        throw new Error('Invalid base64 payload received for image upload');
+    }
+
+    const normalizedBase64 = base64Content.replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalizedBase64) || normalizedBase64.length % 4 !== 0) {
+        throw new Error('Image upload payload is not valid base64 data');
+    }
+
+    const buffer = Buffer.from(normalizedBase64, 'base64');
+    if (!buffer.length) {
+        throw new Error('Decoded image data is empty');
+    }
+
+    if (expectedSize > 0 && buffer.length !== expectedSize) {
+        throw new Error('Uploaded image size does not match decoded payload');
+    }
+
+    return buffer;
+}
+
+function validateImageFileName(fileName: string, mimeType: string): string {
+    const sanitizedFileName = path.basename(fileName);
+    if (!sanitizedFileName) {
+        throw new Error('Invalid file name for uploaded image');
+    }
+
+    const extension = path.extname(sanitizedFileName).toLowerCase();
+    const normalizedMimeType = mimeType?.toLowerCase();
+    if (!normalizedMimeType || !allowedImageMimeTypes[normalizedMimeType]?.includes(extension)) {
+        throw new Error('Unsupported or mismatched image type');
+    }
+
+    return sanitizedFileName;
+}
 
 // Function to save uploaded images to moodboard directory
 async function saveImageToMoodboard(
@@ -45,10 +92,11 @@ async function saveImageToMoodboard(
             Logger.info('Created .superdesign/moodboard directory');
         }
 
-        // Convert base64 to buffer and save file
-        const base64Content = data.base64Data.split(',')[1]; // Remove data:image/jpeg;base64, prefix
-        const buffer = Buffer.from(base64Content, 'base64');
-        const filePath = vscode.Uri.joinPath(moodboardDir, data.fileName);
+        const sanitizedFileName = validateImageFileName(data.fileName, data.mimeType);
+        const sanitizedOriginalName = path.basename(data.originalName);
+        const buffer = validateAndDecodeBase64Image(data.base64Data, data.size);
+
+        const filePath = vscode.Uri.joinPath(moodboardDir, sanitizedFileName);
 
         await vscode.workspace.fs.writeFile(filePath, buffer);
 
@@ -60,8 +108,8 @@ async function saveImageToMoodboard(
         sidebarProvider.sendMessage({
             command: 'imageSavedToMoodboard',
             data: {
-                fileName: data.fileName,
-                originalName: data.originalName,
+                fileName: sanitizedFileName,
+                originalName: sanitizedOriginalName,
                 fullPath: filePath.fsPath,
             },
         });
@@ -73,8 +121,8 @@ async function saveImageToMoodboard(
         sidebarProvider.sendMessage({
             command: 'imageSaveError',
             data: {
-                fileName: data.fileName,
-                originalName: data.originalName,
+                fileName: path.basename(data.fileName),
+                originalName: path.basename(data.originalName),
                 error: error instanceof Error ? error.message : String(error),
             },
         });
@@ -84,12 +132,27 @@ async function saveImageToMoodboard(
 // Function to convert image files to base64 for AI SDK
 async function getBase64Image(filePath: string, sidebarProvider: ChatSidebarProvider) {
     try {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (!workspaceFolder) {
+            throw new Error('Cannot read file: no workspace folder found');
+        }
+
+        const workspaceFsPath = workspaceFolder.uri.fsPath;
+        const resolvedFsPath = path.isAbsolute(filePath)
+            ? path.normalize(filePath)
+            : path.resolve(workspaceFsPath, filePath);
+
+        const relativePath = path.relative(workspaceFsPath, resolvedFsPath);
+        if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+            throw new Error('Requested file is outside of the current workspace');
+        }
+
+        const fileUri = vscode.Uri.file(resolvedFsPath);
         // Read the image file
-        const fileUri = vscode.Uri.file(filePath);
         const fileData = await vscode.workspace.fs.readFile(fileUri);
 
         // Determine MIME type from file extension
-        const extension = filePath.toLowerCase().split('.').pop();
+        const extension = path.extname(resolvedFsPath).toLowerCase().replace('.', '');
         let mimeType: string;
         switch (extension) {
             case 'jpg':
